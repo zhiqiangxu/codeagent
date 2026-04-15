@@ -1,1 +1,7 @@
-// Phase 1 迭代 9 实现
+pub mod protocol;
+pub mod client;
+pub mod tool;
+
+pub use client::{McpClient, McpError};
+pub use protocol::ToolDef;
+pub use tool::McpTool;
