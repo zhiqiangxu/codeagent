@@ -5,8 +5,16 @@ edition = "2021"
 
 [dependencies]
 forge-core = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+glob = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 mockall = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }

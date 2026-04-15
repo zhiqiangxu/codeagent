@@ -1,3 +1,8 @@
-// forge-permissions: PermissionGateway 的具体实现在迭代 1。
-// trait 定义在 forge-core::traits 中。
+mod profile;
+mod rule;
+mod gateway;
+
 pub use forge_core::{PermissionDecision, RuntimePrompter};
+pub use profile::Profile;
+pub use rule::{Action, Rule};
+pub use gateway::PermissionGateway;
