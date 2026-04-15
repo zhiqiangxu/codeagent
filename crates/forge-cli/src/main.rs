@@ -1,3 +1,13 @@
+mod config;
+
+use clap::Parser;
+use config::{AppConfig, CliArgs};
+
 fn main() {
-    println!("CodeForge CLI — 迭代 10 实现");
+    let args = CliArgs::parse();
+    let config = AppConfig::resolve(&args);
+    println!(
+        "CodeForge — model: {}, profile: {:?}",
+        config.model, config.profile
+    );
 }

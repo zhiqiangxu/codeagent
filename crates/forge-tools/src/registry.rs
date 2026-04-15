@@ -1,4 +1,5 @@
-use forge_core::{Tool, ToolOutput};
+use async_trait::async_trait;
+use forge_core::{Tool, ToolCall, ToolExecutor, ToolOutput};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -51,6 +52,29 @@ impl ToolRegistry {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
                 schema: t.schema(),
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for ToolRegistry {
+    async fn execute(&self, call: &ToolCall) -> anyhow::Result<ToolOutput> {
+        let tool = self
+            .get(&call.name)
+            .ok_or_else(|| anyhow::anyhow!("tool not found: {}", call.name))?;
+        tool.execute(call.arguments.clone()).await
+    }
+
+    fn tool_schemas(&self) -> Vec<serde_json::Value> {
+        self.list()
+            .into_iter()
+            .map(|def| {
+                serde_json::json!({
+                    "name": def.name,
+                    "description": def.description,
+                    "input_schema": def.schema,
+                })
             })
             .collect()
     }
