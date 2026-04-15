@@ -1,0 +1,18 @@
+[package]
+name = "forge-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "codeforge"
+path = "src/main.rs"
+
+[dependencies]
+forge-core = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+forge-test-utils = { workspace = true }
