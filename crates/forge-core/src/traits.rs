@@ -206,3 +206,35 @@ pub trait Tool: Send + Sync {
     fn schema(&self) -> serde_json::Value;
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolOutput>;
 }
+
+// ──────────────────────────────────────────────────────
+// 8. ToolExecutor — 工具执行器（封装 Tool + 权限检查）
+// ──────────────────────────────────────────────────────
+
+#[async_trait]
+pub trait ToolExecutor: Send + Sync {
+    async fn execute(&self, call: &ToolCall) -> anyhow::Result<ToolOutput>;
+    fn tool_schemas(&self) -> Vec<serde_json::Value>;
+}
+
+// ──────────────────────────────────────────────────────
+// 9. SessionStore — 会话持久化
+// ──────────────────────────────────────────────────────
+
+#[async_trait]
+pub trait SessionStore: Send + Sync {
+    async fn save(&self, messages: &[Message]) -> anyhow::Result<()>;
+}
+
+// ──────────────────────────────────────────────────────
+// 10. ModelError — 模型调用错误分类
+// ──────────────────────────────────────────────────────
+
+/// 区分暂时性错误（可重试）和致命错误（不可重试）。
+#[derive(Debug, thiserror::Error)]
+pub enum ModelError {
+    #[error("transient error ({status}): {message}")]
+    Transient { status: u16, message: String },
+    #[error("auth error ({status}): {message}")]
+    Auth { status: u16, message: String },
+}
