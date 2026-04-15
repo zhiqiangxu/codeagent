@@ -1,5 +1,7 @@
 mod model_id;
 mod router;
+pub mod format;
+pub mod sse;
 
 // Re-export traits and types from forge-core
 pub use forge_core::{
