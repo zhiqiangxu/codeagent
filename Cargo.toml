@@ -48,6 +48,14 @@ glob = "0.3"
 regex = "1"
 jsonschema = "0.26"
 
+# LSP
+tower-lsp = "0.20"
+
+# gRPC
+tonic = "0.12"
+prost = "0.13"
+tonic-build = "0.12"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

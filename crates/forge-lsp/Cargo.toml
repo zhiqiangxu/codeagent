@@ -5,3 +5,14 @@ edition = "2021"
 
 [dependencies]
 forge-core = { workspace = true }
+forge-permissions = { workspace = true }
+tower-lsp = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+forge-test-utils = { workspace = true }
