@@ -5,3 +5,15 @@ edition = "2021"
 
 [dependencies]
 forge-core = { workspace = true }
+forge-permissions = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+tempfile = { workspace = true }
+forge-test-utils = { workspace = true }
