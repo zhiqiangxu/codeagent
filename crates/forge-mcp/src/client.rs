@@ -111,7 +111,7 @@ where
     }
 
     /// 发送 JSON-RPC 请求并等待响应。
-    async fn send_request(
+    pub async fn send_request(
         &self,
         method: &str,
         params: Option<serde_json::Value>,
