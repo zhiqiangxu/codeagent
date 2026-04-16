@@ -2,11 +2,13 @@
 //!
 //! 注：真实生产环境可替换为 sqlite-vec 扩展，此处用纯 SQL 实现 Phase 2 MVP。
 
+use std::sync::Mutex;
+
 use rusqlite::{params, Connection};
 
 /// SQLite 向量存储。
 pub struct SqliteVecStore {
-    conn: Connection,
+    conn: Mutex<Connection>,
     dimension: usize,
 }
 
@@ -22,7 +24,10 @@ impl SqliteVecStore {
                 source TEXT
             )",
         )?;
-        Ok(Self { conn, dimension })
+        Ok(Self {
+            conn: Mutex::new(conn),
+            dimension,
+        })
     }
 
     /// 插入一条向量记录。
@@ -34,7 +39,8 @@ impl SqliteVecStore {
         source: Option<&str>,
     ) -> anyhow::Result<()> {
         let embedding_json = serde_json::to_string(embedding)?;
-        self.conn.execute(
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
             "INSERT OR REPLACE INTO vec_store (id, content, embedding, source) VALUES (?1, ?2, ?3, ?4)",
             params![id, content, embedding_json, source],
         )?;
@@ -43,8 +49,8 @@ impl SqliteVecStore {
 
     /// 删除一条记录。
     pub fn delete(&self, id: &str) -> anyhow::Result<()> {
-        self.conn
-            .execute("DELETE FROM vec_store WHERE id = ?1", params![id])?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM vec_store WHERE id = ?1", params![id])?;
         Ok(())
     }
 
@@ -54,8 +60,8 @@ impl SqliteVecStore {
         query_vec: &[f32],
         k: usize,
     ) -> anyhow::Result<Vec<VecSearchResult>> {
-        let mut stmt = self
-            .conn
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
             .prepare("SELECT id, content, embedding, source FROM vec_store")?;
 
         let rows = stmt.query_map([], |row| {

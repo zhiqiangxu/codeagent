@@ -1,5 +1,7 @@
 //! FTS5 全文检索存储。
 
+use std::sync::Mutex;
+
 use rusqlite::{params, Connection};
 
 /// FTS5 全文检索结果。
@@ -12,7 +14,7 @@ pub struct FtsSearchResult {
 
 /// SQLite FTS5 全文检索存储。
 pub struct Fts5Store {
-    conn: Connection,
+    conn: Mutex<Connection>,
 }
 
 impl Fts5Store {
@@ -20,7 +22,6 @@ impl Fts5Store {
     pub fn open(path: &str) -> anyhow::Result<Self> {
         let conn = Connection::open(path)?;
 
-        // 创建 FTS5 虚拟表（使用 unicode61 tokenizer 支持 CJK 分词）
         conn.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS fts_docs USING fts5(
                 id UNINDEXED,
@@ -29,15 +30,16 @@ impl Fts5Store {
             )",
         )?;
 
-        Ok(Self { conn })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// 索引一篇文档。
     pub fn index(&self, id: &str, content: &str) -> anyhow::Result<()> {
-        // 先删除旧记录（如果存在），再插入新记录
-        self.conn
-            .execute("DELETE FROM fts_docs WHERE id = ?1", params![id])?;
-        self.conn.execute(
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM fts_docs WHERE id = ?1", params![id])?;
+        conn.execute(
             "INSERT INTO fts_docs (id, content) VALUES (?1, ?2)",
             params![id, content],
         )?;
@@ -46,8 +48,8 @@ impl Fts5Store {
 
     /// 删除一篇文档。
     pub fn delete(&self, id: &str) -> anyhow::Result<()> {
-        self.conn
-            .execute("DELETE FROM fts_docs WHERE id = ?1", params![id])?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM fts_docs WHERE id = ?1", params![id])?;
         Ok(())
     }
 
@@ -57,7 +59,8 @@ impl Fts5Store {
             return Ok(vec![]);
         }
 
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             "SELECT id, content, rank FROM fts_docs WHERE fts_docs MATCH ?1 ORDER BY rank LIMIT ?2",
         )?;
 
