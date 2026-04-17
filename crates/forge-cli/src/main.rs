@@ -8,7 +8,7 @@ use forge_core::{
     AgentEvent, AgentLoop, Content, SimpleContextEngine,
     noop::{NoopCompaction, NoopRetriever},
 };
-use forge_model::AnthropicProvider;
+use forge_model::{AnthropicProvider, OpenAICompatProvider};
 use forge_tools::read::ReadTool;
 use forge_tools::write::WriteTool;
 use forge_tools::edit::EditTool;
@@ -43,16 +43,38 @@ async fn main() -> anyhow::Result<()> {
     let args = CliArgs::parse();
     let config = AppConfig::resolve(&args);
 
-    // API key
-    let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
-    if api_key.is_empty() {
-        eprintln!("Error: ANTHROPIC_API_KEY environment variable not set");
-        eprintln!("Usage: export ANTHROPIC_API_KEY=sk-ant-...");
-        std::process::exit(1);
-    }
+    // Model provider: auto-detect from env vars
+    let anthropic_key = std::env::var("ANTHROPIC_API_KEY").ok();
+    let openai_key = std::env::var("OPENAI_API_KEY").ok();
+    let openai_url = std::env::var("OPENAI_API_URL").ok();
 
-    // Model provider
-    let model = AnthropicProvider::new(api_key);
+    let model: Box<dyn forge_core::ModelProvider> = if let Some(key) = anthropic_key {
+        if !key.is_empty() {
+            Box::new(AnthropicProvider::new(key))
+        } else if openai_key.is_some() || openai_url.is_some() {
+            Box::new(OpenAICompatProvider::new(
+                openai_key.unwrap_or_default(),
+                openai_url.unwrap_or_else(|| "https://api.openai.com/v1".into()),
+            ))
+        } else {
+            eprintln!("Error: No API key found. Set one of:");
+            eprintln!("  ANTHROPIC_API_KEY=sk-ant-...  (Anthropic/Claude)");
+            eprintln!("  OPENAI_API_KEY=sk-...         (OpenAI/GPT)");
+            eprintln!("  OPENAI_API_URL=http://...     (Ollama/local, no key needed)");
+            std::process::exit(1);
+        }
+    } else if openai_key.is_some() || openai_url.is_some() {
+        Box::new(OpenAICompatProvider::new(
+            openai_key.unwrap_or_default(),
+            openai_url.unwrap_or_else(|| "https://api.openai.com/v1".into()),
+        ))
+    } else {
+        eprintln!("Error: No API key found. Set one of:");
+        eprintln!("  ANTHROPIC_API_KEY=sk-ant-...  (Anthropic/Claude)");
+        eprintln!("  OPENAI_API_KEY=sk-...         (OpenAI/GPT)");
+        eprintln!("  OPENAI_API_URL=http://...     (Ollama/local, no key needed)");
+        std::process::exit(1);
+    };
 
     // Working directory
     let cwd = std::env::current_dir()?;

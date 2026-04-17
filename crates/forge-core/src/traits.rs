@@ -124,6 +124,19 @@ pub trait ModelProvider: Send + Sync {
     fn token_counter(&self, messages: &[Message]) -> usize;
 }
 
+#[async_trait]
+impl ModelProvider for Box<dyn ModelProvider> {
+    async fn chat_stream(&self, req: ChatRequest) -> anyhow::Result<StreamResponse> {
+        (**self).chat_stream(req).await
+    }
+    fn capabilities(&self) -> ModelCapabilities {
+        (**self).capabilities()
+    }
+    fn token_counter(&self, messages: &[Message]) -> usize {
+        (**self).token_counter(messages)
+    }
+}
+
 // ──────────────────────────────────────────────────────
 // 2. ContextEngine — 看到什么（上下文编排）
 // ──────────────────────────────────────────────────────
