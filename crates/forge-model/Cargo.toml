@@ -12,6 +12,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 mockall = { workspace = true }

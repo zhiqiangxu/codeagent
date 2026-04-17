@@ -11,6 +11,7 @@ path = "src/main.rs"
 forge-core = { workspace = true }
 forge-tools = { workspace = true }
 forge-memory = { workspace = true }
+forge-model = { workspace = true }
 forge-permissions = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }

@@ -2,6 +2,7 @@ mod model_id;
 mod router;
 pub mod format;
 pub mod sse;
+pub mod anthropic;
 
 // Re-export traits and types from forge-core
 pub use forge_core::{
@@ -11,3 +12,4 @@ pub use forge_core::{
 
 pub use model_id::{ModelId, Provider};
 pub use router::{ModelRouter, RouterError};
+pub use anthropic::AnthropicProvider;
