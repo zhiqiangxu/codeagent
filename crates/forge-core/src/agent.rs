@@ -23,6 +23,7 @@ where
     context: C,
     tools: T,
     max_tool_rounds: usize,
+    model_name: String,
     session: Option<Box<dyn SessionStore>>,
     messages: Vec<Message>,
 }
@@ -39,9 +40,15 @@ where
             context,
             tools,
             max_tool_rounds,
+            model_name: "default".to_string(),
             session: None,
             messages: Vec::new(),
         }
+    }
+
+    pub fn with_model_name(mut self, name: impl Into<String>) -> Self {
+        self.model_name = name.into();
+        self
     }
 
     pub fn with_session(mut self, session: Box<dyn SessionStore>) -> Self {
@@ -85,7 +92,7 @@ where
 
             // 构建请求
             let request = ChatRequest::builder()
-                .model("default")
+                .model(&self.model_name)
                 .messages(assembled)
                 .tools(self.tools.tool_schemas())
                 .build();

@@ -3,7 +3,108 @@
 use forge_core::{StreamEvent, TokenUsage};
 use serde_json::Value;
 
-/// 解析 Anthropic SSE 事件。
+/// Anthropic SSE 流的有状态解析器。
+/// 需要跨事件积累 tool_use 的 input_json_delta。
+pub struct AnthropicSseParser {
+    /// 当前正在构建的 tool call（如果有）
+    current_tool_id: Option<String>,
+    current_tool_name: Option<String>,
+    current_tool_input: String,
+}
+
+impl AnthropicSseParser {
+    pub fn new() -> Self {
+        Self {
+            current_tool_id: None,
+            current_tool_name: None,
+            current_tool_input: String::new(),
+        }
+    }
+
+    /// 解析一个 SSE 事件，可能返回 0 或 1 个 StreamEvent。
+    pub fn parse(&mut self, event_type: &str, data: &Value) -> Option<StreamEvent> {
+        match event_type {
+            "content_block_start" => {
+                let block_type = data.pointer("/content_block/type").and_then(|v| v.as_str());
+                if block_type == Some("tool_use") {
+                    self.current_tool_id = data
+                        .pointer("/content_block/id")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    self.current_tool_name = data
+                        .pointer("/content_block/name")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    self.current_tool_input.clear();
+                }
+                None
+            }
+            "content_block_delta" => {
+                // Text delta
+                if let Some(text) = data.pointer("/delta/text").and_then(|v| v.as_str()) {
+                    return Some(StreamEvent::Delta {
+                        content: text.to_string(),
+                    });
+                }
+                // Tool input JSON delta
+                if let Some(partial) = data
+                    .pointer("/delta/partial_json")
+                    .and_then(|v| v.as_str())
+                {
+                    self.current_tool_input.push_str(partial);
+                }
+                None
+            }
+            "content_block_stop" => {
+                // 如果我们正在积累 tool call，现在 emit 它
+                if let (Some(id), Some(name)) =
+                    (self.current_tool_id.take(), self.current_tool_name.take())
+                {
+                    let arguments = if self.current_tool_input.is_empty() {
+                        Value::Object(serde_json::Map::new())
+                    } else {
+                        serde_json::from_str(&self.current_tool_input)
+                            .unwrap_or(Value::Object(serde_json::Map::new()))
+                    };
+                    self.current_tool_input.clear();
+                    return Some(StreamEvent::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    });
+                }
+                None
+            }
+            "message_delta" => {
+                // usage info comes in message_delta
+                let input = data
+                    .pointer("/usage/input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                let output = data
+                    .pointer("/usage/output_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                if input > 0 || output > 0 {
+                    // Don't emit Done here; wait for message_stop
+                }
+                None
+            }
+            "message_stop" => Some(StreamEvent::Done {
+                usage: TokenUsage::default(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+impl Default for AnthropicSseParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 解析 Anthropic SSE 事件（无状态版本，保持向后兼容）。
 pub fn parse_anthropic_sse(event_type: &str, data: &Value) -> Option<StreamEvent> {
     match event_type {
         "content_block_delta" => {
@@ -11,6 +112,9 @@ pub fn parse_anthropic_sse(event_type: &str, data: &Value) -> Option<StreamEvent
                 .pointer("/delta/text")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            if text.is_empty() {
+                return None;
+            }
             Some(StreamEvent::Delta {
                 content: text.to_string(),
             })
@@ -37,24 +141,15 @@ pub fn parse_anthropic_sse(event_type: &str, data: &Value) -> Option<StreamEvent
                 None
             }
         }
-        "message_stop" => {
-            let input = data
-                .pointer("/usage/input_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize;
-            let output = data
-                .pointer("/usage/output_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize;
-            Some(StreamEvent::Done {
-                usage: TokenUsage { input, output },
-            })
-        }
+        "message_stop" => Some(StreamEvent::Done {
+            usage: TokenUsage::default(),
+        }),
         _ => None,
     }
 }
 
 /// 解析 OpenAI SSE data 行（也适用于 Gemini 兼容模式）。
+/// OpenAI tool calls 也是分块到达的：第一个 chunk 有 id+name，后续只有 arguments 片段。
 pub fn parse_openai_sse(data: &str) -> Option<StreamEvent> {
     if data == "[DONE]" {
         return Some(StreamEvent::Done {
@@ -63,16 +158,6 @@ pub fn parse_openai_sse(data: &str) -> Option<StreamEvent> {
     }
 
     let json: Value = serde_json::from_str(data).ok()?;
-
-    // 检查 usage（如果有的话）
-    let usage = json.get("usage").and_then(|u| {
-        let input = u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let output = u
-            .get("completion_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-        Some(TokenUsage { input, output })
-    });
 
     let choice = json.pointer("/choices/0")?;
     let delta = choice.get("delta")?;
@@ -115,7 +200,7 @@ pub fn parse_openai_sse(data: &str) -> Option<StreamEvent> {
     // finish_reason == stop
     if choice.get("finish_reason").and_then(|v| v.as_str()) == Some("stop") {
         return Some(StreamEvent::Done {
-            usage: usage.unwrap_or_default(),
+            usage: TokenUsage::default(),
         });
     }
 
@@ -160,14 +245,40 @@ mod tests {
 
     #[test]
     fn test_anthropic_parse_stream_done() {
-        let data = json!({"usage": {"input_tokens": 10, "output_tokens": 5}});
-        let event = parse_anthropic_sse("message_stop", &data).unwrap();
+        let event = parse_anthropic_sse("message_stop", &json!({})).unwrap();
+        assert!(matches!(event, StreamEvent::Done { .. }));
+    }
+
+    #[test]
+    fn test_anthropic_stateful_tool_input() {
+        let mut parser = AnthropicSseParser::new();
+
+        // content_block_start: tool_use
+        let r = parser.parse(
+            "content_block_start",
+            &json!({"content_block": {"type": "tool_use", "id": "tc1", "name": "read"}}),
+        );
+        assert!(r.is_none()); // not emitted yet
+
+        // input_json_delta chunks
+        parser.parse(
+            "content_block_delta",
+            &json!({"delta": {"type": "input_json_delta", "partial_json": "{\"path\":"}}),
+        );
+        parser.parse(
+            "content_block_delta",
+            &json!({"delta": {"type": "input_json_delta", "partial_json": "\"/a.rs\"}"}}),
+        );
+
+        // content_block_stop: emit complete tool call
+        let event = parser.parse("content_block_stop", &json!({})).unwrap();
         match event {
-            StreamEvent::Done { usage } => {
-                assert_eq!(usage.input, 10);
-                assert_eq!(usage.output, 5);
+            StreamEvent::ToolCall { id, name, arguments } => {
+                assert_eq!(id, "tc1");
+                assert_eq!(name, "read");
+                assert_eq!(arguments["path"], "/a.rs");
             }
-            _ => panic!("expected Done"),
+            _ => panic!("expected ToolCall"),
         }
     }
 
@@ -199,18 +310,11 @@ mod tests {
     #[test]
     fn test_openai_parse_stream_done() {
         let event = parse_openai_sse("[DONE]").unwrap();
-        match event {
-            StreamEvent::Done { .. } => {}
-            _ => panic!("expected Done"),
-        }
+        assert!(matches!(event, StreamEvent::Done { .. }));
     }
-
-    // -- Error mapping tests (just testing parse behavior) --
 
     #[test]
     fn test_anthropic_error_429() {
-        // 429 errors would come from HTTP response, not SSE
-        // Here we verify unknown event types return None
         let event = parse_anthropic_sse("error", &json!({"error": {"type": "rate_limit_error"}}));
         assert!(event.is_none());
     }

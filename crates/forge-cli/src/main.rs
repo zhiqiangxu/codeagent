@@ -6,15 +6,16 @@ use clap::Parser;
 use config::{AppConfig, CliArgs};
 use forge_core::{
     AgentEvent, AgentLoop, Content, SimpleContextEngine,
-    noop::{NoopCompaction, NoopRetriever},
+    noop::NoopCompaction,
 };
+use forge_memory::ForgemdRetriever;
 use forge_model::{AnthropicProvider, OpenAICompatProvider};
-use forge_tools::read::ReadTool;
-use forge_tools::write::WriteTool;
-use forge_tools::edit::EditTool;
 use forge_tools::bash::BashTool;
+use forge_tools::edit::EditTool;
 use forge_tools::glob_tool::GlobTool;
 use forge_tools::grep::GrepTool;
+use forge_tools::read::ReadTool;
+use forge_tools::write::WriteTool;
 use forge_tools::ToolRegistry;
 
 const SYSTEM_PROMPT: &str = r#"You are CodeForge, an AI-powered coding assistant. You help users with software engineering tasks by reading, writing, and editing code.
@@ -44,25 +45,12 @@ async fn main() -> anyhow::Result<()> {
     let config = AppConfig::resolve(&args);
 
     // Model provider: auto-detect from env vars
-    let anthropic_key = std::env::var("ANTHROPIC_API_KEY").ok();
-    let openai_key = std::env::var("OPENAI_API_KEY").ok();
-    let openai_url = std::env::var("OPENAI_API_URL").ok();
+    let anthropic_key = std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty());
+    let openai_key = std::env::var("OPENAI_API_KEY").ok().filter(|k| !k.is_empty());
+    let openai_url = std::env::var("OPENAI_API_URL").ok().filter(|u| !u.is_empty());
 
     let model: Box<dyn forge_core::ModelProvider> = if let Some(key) = anthropic_key {
-        if !key.is_empty() {
-            Box::new(AnthropicProvider::new(key))
-        } else if openai_key.is_some() || openai_url.is_some() {
-            Box::new(OpenAICompatProvider::new(
-                openai_key.unwrap_or_default(),
-                openai_url.unwrap_or_else(|| "https://api.openai.com/v1".into()),
-            ))
-        } else {
-            eprintln!("Error: No API key found. Set one of:");
-            eprintln!("  ANTHROPIC_API_KEY=sk-ant-...  (Anthropic/Claude)");
-            eprintln!("  OPENAI_API_KEY=sk-...         (OpenAI/GPT)");
-            eprintln!("  OPENAI_API_URL=http://...     (Ollama/local, no key needed)");
-            std::process::exit(1);
-        }
+        Box::new(AnthropicProvider::new(key))
     } else if openai_key.is_some() || openai_url.is_some() {
         Box::new(OpenAICompatProvider::new(
             openai_key.unwrap_or_default(),
@@ -70,20 +58,24 @@ async fn main() -> anyhow::Result<()> {
         ))
     } else {
         eprintln!("Error: No API key found. Set one of:");
-        eprintln!("  ANTHROPIC_API_KEY=sk-ant-...  (Anthropic/Claude)");
-        eprintln!("  OPENAI_API_KEY=sk-...         (OpenAI/GPT)");
-        eprintln!("  OPENAI_API_URL=http://...     (Ollama/local, no key needed)");
+        eprintln!("  ANTHROPIC_API_KEY=sk-ant-...  (Claude)");
+        eprintln!("  OPENAI_API_KEY=sk-...         (OpenAI/Gemini/DeepSeek)");
+        eprintln!("  OPENAI_API_URL=http://...     (Ollama, no key needed)");
         std::process::exit(1);
     };
 
     // Working directory
     let cwd = std::env::current_dir()?;
 
+    // FORGE.md retriever
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let retriever = ForgemdRetriever::new(&home, &cwd);
+
     // Context engine
     let context = SimpleContextEngine::new(
-        Box::new(NoopRetriever),
+        Box::new(retriever),
         Box::new(NoopCompaction),
-        vec![], // tool schemas injected by AgentLoop
+        vec![],
         SYSTEM_PROMPT.to_string(),
         Box::new(char_counter),
     );
@@ -98,7 +90,8 @@ async fn main() -> anyhow::Result<()> {
     tools.register(Arc::new(GrepTool::new(&cwd)))?;
 
     // Agent loop
-    let mut agent = AgentLoop::new(model, context, tools, 10);
+    let mut agent = AgentLoop::new(model, context, tools, 10)
+        .with_model_name(&config.model);
 
     eprintln!("CodeForge v0.1.0 — model: {} | profile: {:?}", config.model, config.profile);
     eprintln!("Working directory: {}", cwd.display());
@@ -107,12 +100,11 @@ async fn main() -> anyhow::Result<()> {
     // Simple REPL loop
     let stdin = std::io::stdin();
     loop {
-        // Read user input
         eprint!("> ");
         let mut input = String::new();
         let n = stdin.read_line(&mut input)?;
         if n == 0 {
-            break; // EOF
+            break;
         }
         let input = input.trim();
         if input.is_empty() {
@@ -122,10 +114,8 @@ async fn main() -> anyhow::Result<()> {
             break;
         }
 
-        // Event channel
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-        // Spawn event printer
         let printer = tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 match event {
@@ -137,7 +127,10 @@ async fn main() -> anyhow::Result<()> {
                     }
                     AgentEvent::ToolResult { output, .. } => {
                         if output.is_error {
-                            eprintln!("[error: {}]", output.content.chars().take(200).collect::<String>());
+                            eprintln!(
+                                "[error: {}]",
+                                output.content.chars().take(200).collect::<String>()
+                            );
                         }
                     }
                     AgentEvent::Done => {
@@ -148,7 +141,6 @@ async fn main() -> anyhow::Result<()> {
             }
         });
 
-        // Run agent
         match agent.run(input, tx).await {
             Ok(_) => {}
             Err(e) => {

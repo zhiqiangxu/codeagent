@@ -8,7 +8,7 @@ use forge_core::{
 use reqwest::Client;
 
 use crate::format::format_anthropic;
-use crate::sse::parse_anthropic_sse;
+use crate::sse::AnthropicSseParser;
 
 pub struct AnthropicProvider {
     api_key: String,
@@ -65,11 +65,13 @@ impl ModelProvider for AnthropicProvider {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
 
-        // 解析 SSE 流
+        // 解析 SSE 流（使用有状态解析器处理 tool_use input 分块）
         let mut stream = resp.bytes_stream();
         tokio::spawn(async move {
             use futures::StreamExt;
             let mut buffer = String::new();
+            let mut parser = AnthropicSseParser::new();
+            let mut got_done = false;
 
             while let Some(chunk) = stream.next().await {
                 let chunk = match chunk {
@@ -94,26 +96,34 @@ impl ModelProvider for AnthropicProvider {
                         }
                     }
 
-                    if event_type.is_empty() || data_str.is_empty() {
+                    if event_type.is_empty() {
                         continue;
                     }
 
-                    if let Ok(data) = serde_json::from_str::<serde_json::Value>(&data_str) {
-                        if let Some(event) = parse_anthropic_sse(&event_type, &data) {
-                            if tx.send(event).await.is_err() {
-                                return;
-                            }
+                    let data = if data_str.is_empty() {
+                        serde_json::Value::Object(serde_json::Map::new())
+                    } else {
+                        serde_json::from_str(&data_str).unwrap_or(serde_json::Value::Null)
+                    };
+
+                    if let Some(event) = parser.parse(&event_type, &data) {
+                        if matches!(event, StreamEvent::Done { .. }) {
+                            got_done = true;
+                        }
+                        if tx.send(event).await.is_err() {
+                            return;
                         }
                     }
                 }
             }
 
-            // 确保发送 Done 事件
-            let _ = tx
-                .send(StreamEvent::Done {
-                    usage: TokenUsage::default(),
-                })
-                .await;
+            if !got_done {
+                let _ = tx
+                    .send(StreamEvent::Done {
+                        usage: TokenUsage::default(),
+                    })
+                    .await;
+            }
         });
 
         Ok(StreamResponse::new(rx))
