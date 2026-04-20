@@ -1,6 +1,9 @@
 use crate::traits::*;
 use crate::types::*;
 
+/// 工具输出最大字符数（超过则截断，避免撑爆 context）。
+const MAX_TOOL_OUTPUT_CHARS: usize = 30_000;
+
 /// Agent Loop 产生的事件，用于驱动 TUI/LSP 渲染。
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -161,11 +164,22 @@ where
                     output: output.clone(),
                 });
 
+                // Truncate large tool outputs to avoid context overflow
+                let content = if output.content.len() > MAX_TOOL_OUTPUT_CHARS {
+                    format!(
+                        "{}...\n[truncated: {} chars total]",
+                        &output.content[..MAX_TOOL_OUTPUT_CHARS],
+                        output.content.len()
+                    )
+                } else {
+                    output.content
+                };
+
                 self.messages.push(Message {
                     role: Role::User,
                     content: Content::ToolResult {
                         tool_use_id: call.id.clone(),
-                        output: output.content,
+                        output: content,
                     },
                     tool_calls: vec![],
                 });

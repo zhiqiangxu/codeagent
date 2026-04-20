@@ -54,25 +54,29 @@ async fn main() -> anyhow::Result<()> {
     let args = CliArgs::parse();
     let config = AppConfig::resolve(&args);
 
-    // Model provider
-    let anthropic_key = std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty());
-    let openai_key = std::env::var("OPENAI_API_KEY").ok().filter(|k| !k.is_empty());
-    let openai_url = std::env::var("OPENAI_API_URL").ok().filter(|u| !u.is_empty());
-
-    let model: Box<dyn forge_core::ModelProvider> = if let Some(key) = anthropic_key {
-        Box::new(AnthropicProvider::new(key))
-    } else if openai_key.is_some() || openai_url.is_some() {
-        Box::new(OpenAICompatProvider::new(
-            openai_key.unwrap_or_default(),
-            openai_url.unwrap_or_else(|| "https://api.openai.com/v1".into()),
-        ))
-    } else {
-        eprintln!("Error: No API key found. Set one of:");
-        eprintln!("  ANTHROPIC_API_KEY=sk-ant-...  (Claude)");
-        eprintln!("  OPENAI_API_KEY=sk-...         (OpenAI/Gemini/DeepSeek)");
-        eprintln!("  OPENAI_API_URL=http://...     (Ollama, no key needed)");
-        std::process::exit(1);
-    };
+    // Model provider (config file > env var)
+    let model: Box<dyn forge_core::ModelProvider> =
+        if let Some(key) = &config.anthropic_api_key {
+            Box::new(AnthropicProvider::new(key.clone()))
+        } else if config.openai_api_key.is_some() || config.openai_api_url.is_some() {
+            Box::new(OpenAICompatProvider::new(
+                config.openai_api_key.clone().unwrap_or_default(),
+                config
+                    .openai_api_url
+                    .clone()
+                    .unwrap_or_else(|| "https://api.openai.com/v1".into()),
+            ))
+        } else {
+            eprintln!("Error: No API key found.");
+            eprintln!("Set env var or create ~/.codeforge/config.toml:");
+            eprintln!();
+            eprintln!("  # ~/.codeforge/config.toml");
+            eprintln!("  anthropic_api_key = \"sk-ant-...\"");
+            eprintln!("  # or");
+            eprintln!("  openai_api_key = \"sk-...\"");
+            eprintln!("  openai_api_url = \"https://api.openai.com/v1\"");
+            std::process::exit(1);
+        };
 
     // Working directory
     let cwd = std::env::current_dir()?;

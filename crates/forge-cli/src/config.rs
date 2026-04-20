@@ -18,9 +18,9 @@ pub struct CliArgs {
     #[arg(long)]
     pub profile: Option<String>,
 
-    /// 配置文件路径
-    #[arg(long, default_value = "config.toml")]
-    pub config: String,
+    /// 配置文件路径（默认 ~/.codeforge/config.toml）
+    #[arg(long)]
+    pub config: Option<String>,
 }
 
 /// TOML 配置文件结构。
@@ -28,6 +28,9 @@ pub struct CliArgs {
 pub struct FileConfig {
     pub model: Option<String>,
     pub profile: Option<String>,
+    pub anthropic_api_key: Option<String>,
+    pub openai_api_key: Option<String>,
+    pub openai_api_url: Option<String>,
 }
 
 /// 最终合并后的应用配置。
@@ -35,13 +38,18 @@ pub struct FileConfig {
 pub struct AppConfig {
     pub model: String,
     pub profile: Profile,
+    pub anthropic_api_key: Option<String>,
+    pub openai_api_key: Option<String>,
+    pub openai_api_url: Option<String>,
 }
 
 impl AppConfig {
     /// 从 4 层来源合并配置：default < file < env < CLI。
     pub fn resolve(args: &CliArgs) -> Self {
-        // 1. 尝试加载配置文件
-        let file_config = Self::load_file(&args.config).unwrap_or_default();
+        // 1. 尝试加载配置文件（CLI 指定 > 默认路径）
+        let default_config = Self::default_config_path();
+        let config_path = args.config.as_deref().unwrap_or(&default_config);
+        let file_config = Self::load_file(config_path).unwrap_or_default();
 
         // 2. 合并 model：CLI > env > file > default
         let model = args
@@ -65,7 +73,34 @@ impl AppConfig {
             _ => Profile::Coding,
         };
 
-        Self { model, profile }
+        // 4. API keys: env > file
+        let anthropic_api_key = std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())
+            .or(file_config.anthropic_api_key);
+
+        let openai_api_key = std::env::var("OPENAI_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())
+            .or(file_config.openai_api_key);
+
+        let openai_api_url = std::env::var("OPENAI_API_URL")
+            .ok()
+            .filter(|u| !u.is_empty())
+            .or(file_config.openai_api_url);
+
+        Self {
+            model,
+            profile,
+            anthropic_api_key,
+            openai_api_key,
+            openai_api_url,
+        }
+    }
+
+    fn default_config_path() -> String {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        format!("{}/.codeforge/config.toml", home)
     }
 
     fn load_file(path: &str) -> Option<FileConfig> {
@@ -118,13 +153,32 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_config_api_keys() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "anthropic_api_key = \"sk-ant-test\"\nopenai_api_url = \"http://localhost:11434/v1\"\n",
+        )
+        .unwrap();
+
+        let args = CliArgs::parse_from([
+            "codeforge",
+            "--config",
+            tmp.path().to_str().unwrap(),
+        ]);
+        let config = AppConfig::resolve(&args);
+        assert_eq!(config.anthropic_api_key, Some("sk-ant-test".into()));
+        assert_eq!(
+            config.openai_api_url,
+            Some("http://localhost:11434/v1".into())
+        );
+    }
+
+    #[test]
     fn test_cli_precedence() {
-        // 创建配置文件 model = "from-file"
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), "model = \"from-file\"\n").unwrap();
 
-        // 不使用真实环境变量（避免污染并行测试），
-        // 只验证 CLI > file > default 优先级。
         // CLI 参数优先于文件
         let args = CliArgs::parse_from([
             "codeforge",

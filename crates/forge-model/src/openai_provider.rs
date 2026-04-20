@@ -8,7 +8,7 @@ use forge_core::{
 use reqwest::Client;
 
 use crate::format::format_openai;
-use crate::sse::parse_openai_sse;
+use crate::sse::OpenAISseParser;
 
 pub struct OpenAICompatProvider {
     api_key: String,
@@ -74,6 +74,8 @@ impl ModelProvider for OpenAICompatProvider {
         tokio::spawn(async move {
             use futures::StreamExt;
             let mut buffer = String::new();
+            let mut parser = OpenAISseParser::new();
+            let mut got_done = false;
 
             while let Some(chunk) = stream.next().await {
                 let chunk = match chunk {
@@ -82,7 +84,6 @@ impl ModelProvider for OpenAICompatProvider {
                 };
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-                // OpenAI SSE: data: {...}\n\n
                 while let Some(pos) = buffer.find("\n\n") {
                     let block = buffer[..pos].to_string();
                     buffer = buffer[pos + 2..].to_string();
@@ -90,7 +91,10 @@ impl ModelProvider for OpenAICompatProvider {
                     for line in block.lines() {
                         if let Some(data) = line.strip_prefix("data: ") {
                             let data = data.trim();
-                            if let Some(event) = parse_openai_sse(data) {
+                            if let Some(event) = parser.parse(data) {
+                                if matches!(event, StreamEvent::Done { .. }) {
+                                    got_done = true;
+                                }
                                 if tx.send(event).await.is_err() {
                                     return;
                                 }
@@ -100,11 +104,13 @@ impl ModelProvider for OpenAICompatProvider {
                 }
             }
 
-            let _ = tx
-                .send(StreamEvent::Done {
-                    usage: TokenUsage::default(),
-                })
-                .await;
+            if !got_done {
+                let _ = tx
+                    .send(StreamEvent::Done {
+                        usage: TokenUsage::default(),
+                    })
+                    .await;
+            }
         });
 
         Ok(StreamResponse::new(rx))

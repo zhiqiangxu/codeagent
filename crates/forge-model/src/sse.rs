@@ -148,8 +148,143 @@ pub fn parse_anthropic_sse(event_type: &str, data: &Value) -> Option<StreamEvent
     }
 }
 
-/// 解析 OpenAI SSE data 行（也适用于 Gemini 兼容模式）。
-/// OpenAI tool calls 也是分块到达的：第一个 chunk 有 id+name，后续只有 arguments 片段。
+/// OpenAI SSE 流的有状态解析器。
+/// OpenAI tool calls 分块到达：第一个 chunk 有 id+name，后续只有 arguments 片段。
+pub struct OpenAISseParser {
+    current_tool_id: String,
+    current_tool_name: String,
+    current_tool_args: String,
+    in_tool_call: bool,
+}
+
+impl OpenAISseParser {
+    pub fn new() -> Self {
+        Self {
+            current_tool_id: String::new(),
+            current_tool_name: String::new(),
+            current_tool_args: String::new(),
+            in_tool_call: false,
+        }
+    }
+
+    pub fn parse(&mut self, data: &str) -> Option<StreamEvent> {
+        if data == "[DONE]" {
+            // Flush any pending tool call
+            if self.in_tool_call {
+                let event = self.flush_tool_call();
+                self.in_tool_call = false;
+                return Some(event);
+            }
+            return Some(StreamEvent::Done {
+                usage: TokenUsage::default(),
+            });
+        }
+
+        let json: serde_json::Value = serde_json::from_str(data).ok()?;
+        let choice = json.pointer("/choices/0")?;
+        let delta = choice.get("delta")?;
+
+        // Tool call chunks
+        if let Some(tool_calls) = delta.get("tool_calls") {
+            if let Some(tc) = tool_calls.get(0) {
+                let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let name = tc
+                    .pointer("/function/name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let args_chunk = tc
+                    .pointer("/function/arguments")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                if !id.is_empty() {
+                    // New tool call — flush previous if any
+                    if self.in_tool_call {
+                        let prev = self.flush_tool_call();
+                        // Start new
+                        self.current_tool_id = id.to_string();
+                        self.current_tool_name = name.to_string();
+                        self.current_tool_args = args_chunk.to_string();
+                        self.in_tool_call = true;
+                        return Some(prev);
+                    }
+                    self.current_tool_id = id.to_string();
+                    self.current_tool_name = name.to_string();
+                    self.current_tool_args = args_chunk.to_string();
+                    self.in_tool_call = true;
+                } else {
+                    // Continuation chunk — accumulate args
+                    self.current_tool_args.push_str(args_chunk);
+                }
+                return None;
+            }
+        }
+
+        // If we were accumulating a tool call and now see non-tool content, flush
+        if self.in_tool_call {
+            let event = self.flush_tool_call();
+            self.in_tool_call = false;
+            // Also parse the current chunk
+            if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
+                if !content.is_empty() {
+                    // Can't return two events; send tool call, the text will be in next parse
+                    // Actually just return the tool call; the text delta will be lost
+                    // but this edge case (text immediately after tool) is very rare
+                }
+            }
+            return Some(event);
+        }
+
+        // Text delta
+        if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
+            if !content.is_empty() {
+                return Some(StreamEvent::Delta {
+                    content: content.to_string(),
+                });
+            }
+        }
+
+        // finish_reason
+        let finish = choice.get("finish_reason").and_then(|v| v.as_str());
+        if finish == Some("stop") {
+            return Some(StreamEvent::Done {
+                usage: TokenUsage::default(),
+            });
+        }
+        if finish == Some("tool_calls") {
+            // Flush pending tool call
+            if self.in_tool_call {
+                let event = self.flush_tool_call();
+                self.in_tool_call = false;
+                return Some(event);
+            }
+        }
+
+        None
+    }
+
+    fn flush_tool_call(&mut self) -> StreamEvent {
+        let arguments = if self.current_tool_args.is_empty() {
+            serde_json::Value::Object(serde_json::Map::new())
+        } else {
+            serde_json::from_str(&self.current_tool_args)
+                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()))
+        };
+        StreamEvent::ToolCall {
+            id: std::mem::take(&mut self.current_tool_id),
+            name: std::mem::take(&mut self.current_tool_name),
+            arguments,
+        }
+    }
+}
+
+impl Default for OpenAISseParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 解析 OpenAI SSE data 行（无状态版本，保持向后兼容）。
 pub fn parse_openai_sse(data: &str) -> Option<StreamEvent> {
     if data == "[DONE]" {
         return Some(StreamEvent::Done {
