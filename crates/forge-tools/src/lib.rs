@@ -8,9 +8,11 @@ pub mod bash;
 pub mod memory_search;
 pub mod memory_save;
 pub mod skills;
+pub mod permission_executor;
 
 pub use forge_core::Tool;
 pub use registry::ToolRegistry;
 pub use memory_search::MemorySearchTool;
 pub use memory_save::MemorySaveTool;
 pub use skills::{SkillMeta, SkillTool, scan_directory, inject_to_prompt};
+pub use permission_executor::PermissionToolExecutor;

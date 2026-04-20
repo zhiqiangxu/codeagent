@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 forge-core = { workspace = true }
+forge-permissions = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }

@@ -5,10 +5,10 @@ use std::sync::Arc;
 use clap::Parser;
 use config::{AppConfig, CliArgs};
 use forge_core::{
-    AgentEvent, AgentLoop, Content, SimpleContextEngine,
+    AgentEvent, AgentLoop, Content, SessionStore, SimpleContextEngine,
     noop::NoopCompaction,
 };
-use forge_memory::ForgemdRetriever;
+use forge_memory::{ForgemdRetriever, SessionManager};
 use forge_model::{AnthropicProvider, OpenAICompatProvider};
 use forge_tools::bash::BashTool;
 use forge_tools::edit::EditTool;
@@ -16,7 +16,7 @@ use forge_tools::glob_tool::GlobTool;
 use forge_tools::grep::GrepTool;
 use forge_tools::read::ReadTool;
 use forge_tools::write::WriteTool;
-use forge_tools::ToolRegistry;
+use forge_tools::{PermissionToolExecutor, ToolRegistry};
 
 const SYSTEM_PROMPT: &str = r#"You are CodeForge, an AI-powered coding assistant. You help users with software engineering tasks by reading, writing, and editing code.
 
@@ -39,12 +39,22 @@ fn char_counter(messages: &[forge_core::Message]) -> usize {
         .sum()
 }
 
+/// SessionManager → SessionStore adapter
+struct SessionStoreAdapter(SessionManager);
+
+#[async_trait::async_trait]
+impl SessionStore for SessionStoreAdapter {
+    async fn save(&self, messages: &[forge_core::Message]) -> anyhow::Result<()> {
+        self.0.save(messages).await
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = CliArgs::parse();
     let config = AppConfig::resolve(&args);
 
-    // Model provider: auto-detect from env vars
+    // Model provider
     let anthropic_key = std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty());
     let openai_key = std::env::var("OPENAI_API_KEY").ok().filter(|k| !k.is_empty());
     let openai_url = std::env::var("OPENAI_API_URL").ok().filter(|u| !u.is_empty());
@@ -80,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
         Box::new(char_counter),
     );
 
-    // Tool registry
+    // Tool registry with permission check
     let mut tools = ToolRegistry::new();
     tools.register(Arc::new(ReadTool::new(&cwd)))?;
     tools.register(Arc::new(WriteTool::new(&cwd)))?;
@@ -89,15 +99,24 @@ async fn main() -> anyhow::Result<()> {
     tools.register(Arc::new(GlobTool::new(&cwd)))?;
     tools.register(Arc::new(GrepTool::new(&cwd)))?;
 
+    let tools = PermissionToolExecutor::new(tools, config.profile.clone());
+
+    // Session persistence
+    let session_dir = std::path::PathBuf::from(&home).join(".codeforge").join("sessions");
+    std::fs::create_dir_all(&session_dir)?;
+    let session_path = session_dir.join("current.jsonl");
+    let session = SessionStoreAdapter(SessionManager::new(&session_path));
+
     // Agent loop
     let mut agent = AgentLoop::new(model, context, tools, 10)
-        .with_model_name(&config.model);
+        .with_model_name(&config.model)
+        .with_session(Box::new(session));
 
     eprintln!("CodeForge v0.1.0 — model: {} | profile: {:?}", config.model, config.profile);
     eprintln!("Working directory: {}", cwd.display());
     eprintln!("Type your message (Ctrl+D to exit):\n");
 
-    // Simple REPL loop
+    // REPL
     let stdin = std::io::stdin();
     loop {
         eprint!("> ");
@@ -119,23 +138,12 @@ async fn main() -> anyhow::Result<()> {
         let printer = tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 match event {
-                    AgentEvent::Delta { content } => {
-                        print!("{}", content);
+                    AgentEvent::Delta { content } => print!("{}", content),
+                    AgentEvent::ToolCallStart { name, .. } => eprintln!("\n[tool: {}]", name),
+                    AgentEvent::ToolResult { output, .. } if output.is_error => {
+                        eprintln!("[error: {}]", output.content.chars().take(200).collect::<String>());
                     }
-                    AgentEvent::ToolCallStart { name, .. } => {
-                        eprintln!("\n[tool: {}]", name);
-                    }
-                    AgentEvent::ToolResult { output, .. } => {
-                        if output.is_error {
-                            eprintln!(
-                                "[error: {}]",
-                                output.content.chars().take(200).collect::<String>()
-                            );
-                        }
-                    }
-                    AgentEvent::Done => {
-                        println!();
-                    }
+                    AgentEvent::Done => println!(),
                     _ => {}
                 }
             }
@@ -143,9 +151,7 @@ async fn main() -> anyhow::Result<()> {
 
         match agent.run(input, tx).await {
             Ok(_) => {}
-            Err(e) => {
-                eprintln!("\nError: {}", e);
-            }
+            Err(e) => eprintln!("\nError: {}", e),
         }
 
         printer.await?;
