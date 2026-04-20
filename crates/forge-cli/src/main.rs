@@ -1,9 +1,10 @@
 mod config;
 
+use std::io::Write;
 use std::sync::Arc;
 
 use clap::Parser;
-use config::{AppConfig, CliArgs};
+use config::{AppConfig, CliArgs, SubCommand};
 use forge_core::{
     AgentEvent, AgentLoop, Content, SessionStore, SimpleContextEngine,
     noop::NoopCompaction,
@@ -29,6 +30,18 @@ When the user asks you to do something:
 
 Be concise. Lead with the answer, not the reasoning."#;
 
+const CONFIG_TEMPLATE: &str = r#"# CodeForge configuration
+# model = "claude-sonnet-4-20250514"
+# profile = "coding"
+
+# Anthropic (Claude)
+# anthropic_api_key = "sk-ant-..."
+
+# OpenAI / Gemini / DeepSeek / Ollama
+# openai_api_key = "sk-..."
+# openai_api_url = "https://api.openai.com/v1"
+"#;
+
 fn char_counter(messages: &[forge_core::Message]) -> usize {
     messages
         .iter()
@@ -39,7 +52,6 @@ fn char_counter(messages: &[forge_core::Message]) -> usize {
         .sum()
 }
 
-/// SessionManager → SessionStore adapter
 struct SessionStoreAdapter(SessionManager);
 
 #[async_trait::async_trait]
@@ -49,12 +61,36 @@ impl SessionStore for SessionStoreAdapter {
     }
 }
 
+fn handle_init() -> anyhow::Result<()> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let config_dir = std::path::PathBuf::from(&home).join(".codeforge");
+    std::fs::create_dir_all(&config_dir)?;
+    let config_path = config_dir.join("config.toml");
+
+    if config_path.exists() {
+        eprintln!("Config already exists: {}", config_path.display());
+        eprintln!("Edit it manually or delete to regenerate.");
+        return Ok(());
+    }
+
+    std::fs::write(&config_path, CONFIG_TEMPLATE)?;
+    eprintln!("Created {}", config_path.display());
+    eprintln!("Edit it to add your API key.");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = CliArgs::parse();
+
+    // Handle subcommands
+    if let Some(SubCommand::Init) = &args.command {
+        return handle_init();
+    }
+
     let config = AppConfig::resolve(&args);
 
-    // Model provider (config file > env var)
+    // Model provider
     let model: Box<dyn forge_core::ModelProvider> =
         if let Some(key) = &config.anthropic_api_key {
             Box::new(AnthropicProvider::new(key.clone()))
@@ -68,24 +104,19 @@ async fn main() -> anyhow::Result<()> {
             ))
         } else {
             eprintln!("Error: No API key found.");
-            eprintln!("Set env var or create ~/.codeforge/config.toml:");
-            eprintln!();
-            eprintln!("  # ~/.codeforge/config.toml");
-            eprintln!("  anthropic_api_key = \"sk-ant-...\"");
-            eprintln!("  # or");
-            eprintln!("  openai_api_key = \"sk-...\"");
-            eprintln!("  openai_api_url = \"https://api.openai.com/v1\"");
+            eprintln!("Run `codeforge init` to create a config file, or set env vars:");
+            eprintln!("  ANTHROPIC_API_KEY=sk-ant-...  (Claude)");
+            eprintln!("  OPENAI_API_KEY=sk-...         (OpenAI/Gemini/DeepSeek)");
+            eprintln!("  OPENAI_API_URL=http://...     (Ollama, no key needed)");
             std::process::exit(1);
         };
 
     // Working directory
     let cwd = std::env::current_dir()?;
-
-    // FORGE.md retriever
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let retriever = ForgemdRetriever::new(&home, &cwd);
 
     // Context engine
+    let retriever = ForgemdRetriever::new(&home, &cwd);
     let context = SimpleContextEngine::new(
         Box::new(retriever),
         Box::new(NoopCompaction),
@@ -94,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
         Box::new(char_counter),
     );
 
-    // Tool registry with permission check
+    // Tools with permission check
     let mut tools = ToolRegistry::new();
     tools.register(Arc::new(ReadTool::new(&cwd)))?;
     tools.register(Arc::new(WriteTool::new(&cwd)))?;
@@ -102,28 +133,38 @@ async fn main() -> anyhow::Result<()> {
     tools.register(Arc::new(BashTool::new(&cwd)))?;
     tools.register(Arc::new(GlobTool::new(&cwd)))?;
     tools.register(Arc::new(GrepTool::new(&cwd)))?;
-
     let tools = PermissionToolExecutor::new(tools, config.profile.clone());
 
-    // Session persistence
+    // Session
     let session_dir = std::path::PathBuf::from(&home).join(".codeforge").join("sessions");
     std::fs::create_dir_all(&session_dir)?;
     let session_path = session_dir.join("current.jsonl");
-    let session = SessionStoreAdapter(SessionManager::new(&session_path));
+    let session_mgr = SessionManager::new(&session_path);
 
     // Agent loop
     let mut agent = AgentLoop::new(model, context, tools, 10)
         .with_model_name(&config.model)
-        .with_session(Box::new(session));
+        .with_session(Box::new(SessionStoreAdapter(SessionManager::new(&session_path))));
+
+    // Resume previous session
+    if args.resume {
+        if let Ok(messages) = session_mgr.load().await {
+            if !messages.is_empty() {
+                eprintln!("Resumed {} messages from previous session.", messages.len());
+                agent.set_messages(messages);
+            }
+        }
+    }
 
     eprintln!("CodeForge v0.1.0 — model: {} | profile: {:?}", config.model, config.profile);
     eprintln!("Working directory: {}", cwd.display());
-    eprintln!("Type your message (Ctrl+D to exit):\n");
+    eprintln!("Commands: /quit, /clear | Ctrl+D to exit\n");
 
     // REPL
     let stdin = std::io::stdin();
     loop {
         eprint!("> ");
+        std::io::stderr().flush()?;
         let mut input = String::new();
         let n = stdin.read_line(&mut input)?;
         if n == 0 {
@@ -133,8 +174,14 @@ async fn main() -> anyhow::Result<()> {
         if input.is_empty() {
             continue;
         }
-        if input == "/quit" || input == "/exit" {
-            break;
+        match input {
+            "/quit" | "/exit" => break,
+            "/clear" => {
+                agent.clear_messages();
+                eprintln!("Conversation cleared.");
+                continue;
+            }
+            _ => {}
         }
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -142,12 +189,23 @@ async fn main() -> anyhow::Result<()> {
         let printer = tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 match event {
-                    AgentEvent::Delta { content } => print!("{}", content),
-                    AgentEvent::ToolCallStart { name, .. } => eprintln!("\n[tool: {}]", name),
-                    AgentEvent::ToolResult { output, .. } if output.is_error => {
-                        eprintln!("[error: {}]", output.content.chars().take(200).collect::<String>());
+                    AgentEvent::Delta { content } => {
+                        print!("{}", content);
+                        let _ = std::io::stdout().flush();
                     }
-                    AgentEvent::Done => println!(),
+                    AgentEvent::ToolCallStart { name, .. } => {
+                        eprintln!("\n[tool: {}]", name);
+                    }
+                    AgentEvent::ToolResult { output, .. } if output.is_error => {
+                        eprintln!(
+                            "[error: {}]",
+                            output.content.chars().take(200).collect::<String>()
+                        );
+                    }
+                    AgentEvent::Done => {
+                        println!();
+                        let _ = std::io::stdout().flush();
+                    }
                     _ => {}
                 }
             }

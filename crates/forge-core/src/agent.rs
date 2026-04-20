@@ -59,6 +59,16 @@ where
         self
     }
 
+    /// 设置初始消息（用于 session resume）。
+    pub fn set_messages(&mut self, messages: Vec<Message>) {
+        self.messages = messages;
+    }
+
+    /// 清空对话历史。
+    pub fn clear_messages(&mut self) {
+        self.messages.clear();
+    }
+
     /// 运行一轮对话。返回最终的 assistant 文本回复。
     pub async fn run(
         &mut self,

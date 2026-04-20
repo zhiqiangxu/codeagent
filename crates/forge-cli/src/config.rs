@@ -21,6 +21,20 @@ pub struct CliArgs {
     /// 配置文件路径（默认 ~/.codeforge/config.toml）
     #[arg(long)]
     pub config: Option<String>,
+
+    /// 恢复上次对话
+    #[arg(long)]
+    pub resume: bool,
+
+    /// 子命令
+    #[command(subcommand)]
+    pub command: Option<SubCommand>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum SubCommand {
+    /// 生成配置文件模板
+    Init,
 }
 
 /// TOML 配置文件结构。
