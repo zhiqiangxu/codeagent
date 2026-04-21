@@ -42,6 +42,20 @@ const CONFIG_TEMPLATE: &str = r#"# CodeForge configuration
 # openai_api_url = "https://api.openai.com/v1"
 "#;
 
+const HELP_TEXT: &str = r#"Commands:
+  /help     Show this help
+  /clear    Clear conversation history
+  /quit     Exit CodeForge
+
+Flags:
+  --model <name>     Model to use (default: claude-sonnet-4-20250514)
+  --profile <name>   Permission profile: readonly, coding, full
+  --resume           Resume previous conversation
+  --mode lsp         Start as LSP server (for IDE integration)
+
+Config: ~/.codeforge/config.toml (run `codeforge init` to create)
+"#;
+
 fn char_counter(messages: &[forge_core::Message]) -> usize {
     messages
         .iter()
@@ -79,43 +93,60 @@ fn handle_init() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let args = CliArgs::parse();
-
-    // Handle subcommands
-    if let Some(SubCommand::Init) = &args.command {
-        return handle_init();
+fn create_model(config: &AppConfig) -> Box<dyn forge_core::ModelProvider> {
+    if let Some(key) = &config.anthropic_api_key {
+        return Box::new(AnthropicProvider::new(key.clone()));
     }
+    if config.openai_api_key.is_some() || config.openai_api_url.is_some() {
+        return Box::new(OpenAICompatProvider::new(
+            config.openai_api_key.clone().unwrap_or_default(),
+            config
+                .openai_api_url
+                .clone()
+                .unwrap_or_else(|| "https://api.openai.com/v1".into()),
+        ));
+    }
+    eprintln!("Error: No API key found.");
+    eprintln!("Run `codeforge init` to create a config file, or set env vars:");
+    eprintln!("  ANTHROPIC_API_KEY=sk-ant-...  (Claude)");
+    eprintln!("  OPENAI_API_KEY=sk-...         (OpenAI/Gemini/DeepSeek)");
+    eprintln!("  OPENAI_API_URL=http://...     (Ollama, no key needed)");
+    std::process::exit(1);
+}
 
-    let config = AppConfig::resolve(&args);
+fn create_tools(cwd: &std::path::Path, config: &AppConfig) -> PermissionToolExecutor<ToolRegistry> {
+    let mut tools = ToolRegistry::new();
+    let _ = tools.register(Arc::new(ReadTool::new(cwd)));
+    let _ = tools.register(Arc::new(WriteTool::new(cwd)));
+    let _ = tools.register(Arc::new(EditTool::new(cwd)));
+    let _ = tools.register(Arc::new(BashTool::new(cwd)));
+    let _ = tools.register(Arc::new(GlobTool::new(cwd)));
+    let _ = tools.register(Arc::new(GrepTool::new(cwd)));
+    PermissionToolExecutor::new(tools, config.profile.clone())
+}
 
-    // Model provider
-    let model: Box<dyn forge_core::ModelProvider> =
-        if let Some(key) = &config.anthropic_api_key {
-            Box::new(AnthropicProvider::new(key.clone()))
-        } else if config.openai_api_key.is_some() || config.openai_api_url.is_some() {
-            Box::new(OpenAICompatProvider::new(
-                config.openai_api_key.clone().unwrap_or_default(),
-                config
-                    .openai_api_url
-                    .clone()
-                    .unwrap_or_else(|| "https://api.openai.com/v1".into()),
-            ))
-        } else {
-            eprintln!("Error: No API key found.");
-            eprintln!("Run `codeforge init` to create a config file, or set env vars:");
-            eprintln!("  ANTHROPIC_API_KEY=sk-ant-...  (Claude)");
-            eprintln!("  OPENAI_API_KEY=sk-...         (OpenAI/Gemini/DeepSeek)");
-            eprintln!("  OPENAI_API_URL=http://...     (Ollama, no key needed)");
-            std::process::exit(1);
-        };
+async fn run_lsp() -> anyhow::Result<()> {
+    use forge_lsp::{CodeForgeLsp, ServerState};
+    use tower_lsp::{LspService, Server};
 
-    // Working directory
+    let stdin = tokio::io::stdin();
+    let stdout = tokio::io::stdout();
+
+    let (service, socket) = LspService::new(|client| CodeForgeLsp {
+        client,
+        state: ServerState::new(),
+    });
+
+    Server::new(stdin, stdout, socket).serve(service).await;
+    Ok(())
+}
+
+async fn run_repl(args: &CliArgs, config: &AppConfig) -> anyhow::Result<()> {
+    let model = create_model(config);
     let cwd = std::env::current_dir()?;
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
 
-    // Context engine
+    // Context engine with ForgemdRetriever
     let retriever = ForgemdRetriever::new(&home, &cwd);
     let context = SimpleContextEngine::new(
         Box::new(retriever),
@@ -125,15 +156,8 @@ async fn main() -> anyhow::Result<()> {
         Box::new(char_counter),
     );
 
-    // Tools with permission check
-    let mut tools = ToolRegistry::new();
-    tools.register(Arc::new(ReadTool::new(&cwd)))?;
-    tools.register(Arc::new(WriteTool::new(&cwd)))?;
-    tools.register(Arc::new(EditTool::new(&cwd)))?;
-    tools.register(Arc::new(BashTool::new(&cwd)))?;
-    tools.register(Arc::new(GlobTool::new(&cwd)))?;
-    tools.register(Arc::new(GrepTool::new(&cwd)))?;
-    let tools = PermissionToolExecutor::new(tools, config.profile.clone());
+    // Tools
+    let tools = create_tools(&cwd, config);
 
     // Session
     let session_dir = std::path::PathBuf::from(&home).join(".codeforge").join("sessions");
@@ -141,12 +165,12 @@ async fn main() -> anyhow::Result<()> {
     let session_path = session_dir.join("current.jsonl");
     let session_mgr = SessionManager::new(&session_path);
 
-    // Agent loop
+    // Agent
     let mut agent = AgentLoop::new(model, context, tools, 10)
         .with_model_name(&config.model)
         .with_session(Box::new(SessionStoreAdapter(SessionManager::new(&session_path))));
 
-    // Resume previous session
+    // Resume
     if args.resume {
         if let Ok(messages) = session_mgr.load().await {
             if !messages.is_empty() {
@@ -158,16 +182,14 @@ async fn main() -> anyhow::Result<()> {
 
     eprintln!("CodeForge v0.1.0 — model: {} | profile: {:?}", config.model, config.profile);
     eprintln!("Working directory: {}", cwd.display());
-    eprintln!("Commands: /quit, /clear | Ctrl+D to exit\n");
+    eprintln!("Type /help for commands. Ctrl+D to exit.\n");
 
-    // REPL
     let stdin = std::io::stdin();
     loop {
         eprint!("> ");
         std::io::stderr().flush()?;
         let mut input = String::new();
-        let n = stdin.read_line(&mut input)?;
-        if n == 0 {
+        if stdin.read_line(&mut input)? == 0 {
             break;
         }
         let input = input.trim();
@@ -179,6 +201,10 @@ async fn main() -> anyhow::Result<()> {
             "/clear" => {
                 agent.clear_messages();
                 eprintln!("Conversation cleared.");
+                continue;
+            }
+            "/help" => {
+                eprint!("{}", HELP_TEXT);
                 continue;
             }
             _ => {}
@@ -220,4 +246,20 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args = CliArgs::parse();
+
+    if let Some(SubCommand::Init) = &args.command {
+        return handle_init();
+    }
+
+    let config = AppConfig::resolve(&args);
+
+    match args.mode.as_str() {
+        "lsp" => run_lsp().await,
+        _ => run_repl(&args, &config).await,
+    }
 }

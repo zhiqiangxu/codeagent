@@ -13,6 +13,8 @@ forge-tools = { workspace = true }
 forge-memory = { workspace = true }
 forge-model = { workspace = true }
 forge-permissions = { workspace = true }
+forge-lsp = { workspace = true }
+tower-lsp = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }

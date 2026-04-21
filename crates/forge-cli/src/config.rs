@@ -26,6 +26,10 @@ pub struct CliArgs {
     #[arg(long)]
     pub resume: bool,
 
+    /// 运行模式：repl（默认）、lsp
+    #[arg(long, default_value = "repl")]
+    pub mode: String,
+
     /// 子命令
     #[command(subcommand)]
     pub command: Option<SubCommand>,
