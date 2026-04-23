@@ -1,11 +1,10 @@
-use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use forge_core::{EmbeddingProvider, MemoryRetriever, RetrieveOptions};
-use forge_memory::{Fts5Store, HybridRetriever, SqliteVecStore};
+use forge_memory::{HybridRetriever, MemoryDb};
 use tempfile::TempDir;
 
-/// 确定性 Mock Embedding：基于文本长度生成固定维度向量。
 struct FixedEmbedding {
     dim: usize,
 }
@@ -16,7 +15,6 @@ impl EmbeddingProvider for FixedEmbedding {
         Ok(texts
             .iter()
             .map(|t| {
-                // 基于文本内容生成确定性向量
                 let seed = t.bytes().map(|b| b as f32).sum::<f32>();
                 (0..self.dim)
                     .map(|i| ((seed + i as f32) * 0.01).sin())
@@ -31,19 +29,17 @@ impl EmbeddingProvider for FixedEmbedding {
 }
 
 fn create_hybrid(tmp: &TempDir) -> HybridRetriever {
-    let vec_store =
-        SqliteVecStore::open(tmp.path().join("vec.db").to_str().unwrap(), 8).unwrap();
-    let fts_store = Fts5Store::open(tmp.path().join("fts.db").to_str().unwrap()).unwrap();
+    let db = Arc::new(
+        MemoryDb::open(tmp.path().join("memory.db").to_str().unwrap()).unwrap(),
+    );
     let embedding = Box::new(FixedEmbedding { dim: 8 });
-
-    HybridRetriever::new(vec_store, fts_store, embedding, 0.5)
+    HybridRetriever::new(db, embedding, 0.5)
 }
 
 #[tokio::test]
 async fn test_hybrid_index_and_retrieve() {
     let tmp = TempDir::new().unwrap();
 
-    // 创建测试文件
     std::fs::write(tmp.path().join("a.rs"), "fn hello() { println!(\"hello rust\"); }").unwrap();
     std::fs::write(tmp.path().join("b.rs"), "fn goodbye() { println!(\"goodbye python\"); }")
         .unwrap();
@@ -70,7 +66,6 @@ async fn test_hybrid_index_and_retrieve() {
         .await;
 
     assert!(!results.is_empty(), "should find results for 'rust'");
-    // 至少有包含 "rust" 的文档被返回
     assert!(results.iter().any(|r| r.content.contains("rust")));
 }
 
@@ -79,10 +74,7 @@ async fn test_hybrid_empty_query() {
     let tmp = TempDir::new().unwrap();
     let retriever = create_hybrid(&tmp);
 
-    let results = retriever
-        .retrieve("", RetrieveOptions::default())
-        .await;
-
+    let results = retriever.retrieve("", RetrieveOptions::default()).await;
     assert!(results.is_empty());
 }
 
@@ -90,7 +82,6 @@ async fn test_hybrid_empty_query() {
 async fn test_hybrid_filters_by_scope() {
     let tmp = TempDir::new().unwrap();
 
-    // 创建不同 scope 的文件
     let global_dir = tmp.path().join("global");
     let project_dir = tmp.path().join("project");
     std::fs::create_dir_all(&global_dir).unwrap();
@@ -118,7 +109,6 @@ async fn test_hybrid_filters_by_scope() {
         )
         .await;
 
-    // 只返回 project scope 的结果
     for r in &results {
         if let Some(ref source) = r.source {
             assert!(

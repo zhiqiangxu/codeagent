@@ -9,7 +9,10 @@ use forge_core::{
     AgentEvent, AgentLoop, Content, SessionStore, SimpleContextEngine,
     noop::NoopCompaction,
 };
-use forge_memory::{ForgemdRetriever, SessionManager};
+use forge_memory::{
+    CombinedRetriever, ForgemdRetriever, HybridRetriever, MemoryDb, OpenAIEmbedding,
+    SessionManager,
+};
 use forge_model::{AnthropicProvider, OpenAICompatProvider};
 use forge_tools::bash::BashTool;
 use forge_tools::edit::EditTool;
@@ -146,10 +149,31 @@ async fn run_repl(args: &CliArgs, config: &AppConfig) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
 
-    // Context engine with ForgemdRetriever
-    let retriever = ForgemdRetriever::new(&home, &cwd);
+    // Memory retriever: ForgemdRetriever (always) + HybridRetriever (if embedding available)
+    let forgemd = ForgemdRetriever::new(&home, &cwd);
+
+    let data_dir = std::path::PathBuf::from(&home).join(".codeforge").join("data");
+    std::fs::create_dir_all(&data_dir)?;
+
+    let retriever: Box<dyn forge_core::MemoryRetriever> =
+        if let Some(key) = &config.openai_api_key {
+            let embedding = OpenAIEmbedding::new("text-embedding-3-small", key.clone());
+            let db = std::sync::Arc::new(
+                MemoryDb::open(data_dir.join("memory.db").to_str().unwrap())?,
+            );
+            let hybrid = HybridRetriever::new(db, Box::new(embedding), 0.5);
+
+            eprintln!("[RAG enabled: HybridRetriever + ForgemdRetriever]");
+            Box::new(CombinedRetriever::new(vec![
+                Box::new(forgemd),
+                Box::new(hybrid),
+            ]))
+        } else {
+            Box::new(forgemd)
+        };
+
     let context = SimpleContextEngine::new(
-        Box::new(retriever),
+        retriever,
         Box::new(NoopCompaction),
         vec![],
         SYSTEM_PROMPT.to_string(),

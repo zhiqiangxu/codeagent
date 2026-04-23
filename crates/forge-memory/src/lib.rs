@@ -6,6 +6,8 @@ pub mod fts_store;
 pub mod hybrid;
 pub mod compaction;
 pub mod indexer;
+pub mod combined;
+pub mod memory_db;
 
 pub use forge_core::{EmbeddingProvider, MemoryChunk, MemoryRetriever, RetrieveOptions};
 pub use forgemd::ForgemdRetriever;
@@ -16,3 +18,5 @@ pub use fts_store::Fts5Store;
 pub use hybrid::HybridRetriever;
 pub use compaction::LlmCompaction;
 pub use indexer::IncrementalIndexer;
+pub use combined::CombinedRetriever;
+pub use memory_db::{MemoryDb, content_hash};

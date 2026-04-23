@@ -1,37 +1,40 @@
 //! HybridRetriever: 向量相似度 + FTS5 全文检索混合排序。
 //!
 //! 使用 RRF (Reciprocal Rank Fusion) 合并两个排序结果。
+//! 基于 MemoryDb 统一存储，支持 hash 去重避免重复索引。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use forge_core::{EmbeddingProvider, MemoryChunk, MemoryRetriever, RetrieveOptions};
 
-use crate::fts_store::Fts5Store;
-use crate::vec_store::SqliteVecStore;
+use crate::memory_db::{content_hash, MemoryDb};
 
 /// 混合检索器：向量 + FTS5，使用 RRF 合并排序。
 pub struct HybridRetriever {
-    vec_store: SqliteVecStore,
-    fts_store: Fts5Store,
+    db: Arc<MemoryDb>,
     embedding: Box<dyn EmbeddingProvider>,
     vec_weight: f32,
 }
 
 impl HybridRetriever {
     pub fn new(
-        vec_store: SqliteVecStore,
-        fts_store: Fts5Store,
+        db: Arc<MemoryDb>,
         embedding: Box<dyn EmbeddingProvider>,
         vec_weight: f32,
     ) -> Self {
         Self {
-            vec_store,
-            fts_store,
+            db,
             embedding,
             vec_weight,
         }
+    }
+
+    /// 获取底层 MemoryDb（用于外部启动索引等）。
+    pub fn db(&self) -> &Arc<MemoryDb> {
+        &self.db
     }
 }
 
@@ -43,28 +46,27 @@ impl MemoryRetriever for HybridRetriever {
         }
 
         let top_k = opts.top_k.unwrap_or(10);
-        let fetch_k = top_k * 3; // 多取一些用于合并
+        let fetch_k = top_k * 3;
 
         // 向量检索
-        let vec_results = if let Ok(embeddings) = self.embedding.embed(&[query.to_string()]).await {
-            if let Some(query_vec) = embeddings.first() {
-                self.vec_store.knn(query_vec, fetch_k).unwrap_or_default()
+        let vec_results =
+            if let Ok(embeddings) = self.embedding.embed(&[query.to_string()]).await {
+                if let Some(query_vec) = embeddings.first() {
+                    self.db.vec_knn(query_vec, fetch_k).unwrap_or_default()
+                } else {
+                    vec![]
+                }
             } else {
                 vec![]
-            }
-        } else {
-            vec![]
-        };
+            };
 
         // FTS5 检索
-        let fts_results = self.fts_store.search(query, fetch_k).unwrap_or_default();
+        let fts_results = self.db.fts_search(query, fetch_k).unwrap_or_default();
 
-        // Scope 过滤
+        // Scope 过滤 + RRF 合并
         let scope_filter = opts.scope.as_deref();
-
-        // RRF 合并
         let mut scores: HashMap<String, (f32, String, Option<String>)> = HashMap::new();
-        let rrf_k = 60.0_f32; // RRF 常数
+        let rrf_k = 60.0_f32;
 
         for (rank, result) in vec_results.iter().enumerate() {
             if let Some(scope) = scope_filter {
@@ -95,7 +97,6 @@ impl MemoryRetriever for HybridRetriever {
             entry.0 += rrf_score;
         }
 
-        // 按 RRF score 降序排列
         let mut merged: Vec<(String, f32, String, Option<String>)> = scores
             .into_iter()
             .map(|(id, (score, content, source))| (id, score, content, source))
@@ -115,18 +116,31 @@ impl MemoryRetriever for HybridRetriever {
 
     async fn index(&self, files: &[PathBuf]) -> anyhow::Result<()> {
         for path in files {
-            let content = tokio::fs::read_to_string(path).await?;
             let id = path.to_string_lossy().to_string();
+            let content = tokio::fs::read_to_string(path).await?;
+            let hash = content_hash(&content);
+
+            // Hash 去重：相同则跳过
+            if let Some(existing_hash) = self.db.get_hash(&id) {
+                if existing_hash == hash {
+                    continue;
+                }
+                // Hash 不同，删旧索引
+                self.db.delete_all(&id)?;
+            }
 
             // FTS 索引
-            self.fts_store.index(&id, &content)?;
+            self.db.fts_index(&id, &content)?;
 
             // 向量索引
             let embeddings = self.embedding.embed(&[content.clone()]).await?;
             if let Some(vec) = embeddings.first() {
-                self.vec_store
-                    .insert(&id, &content, vec, Some(&id))?;
+                self.db.vec_insert(&id, &content, vec, Some(&id))?;
             }
+
+            // 记录 meta
+            self.db
+                .upsert_meta(&id, &hash, content.len() as u64)?;
         }
         Ok(())
     }
@@ -167,11 +181,9 @@ mod tests {
 
         let result = rrf_merge(&vec_rank, &fts_rank, 0.5);
 
-        // A 和 B 都出现在两端，分数应该最高
         let top_two: Vec<&str> = result.iter().take(2).map(|(id, _)| id.as_str()).collect();
         assert!(top_two.contains(&"A"));
         assert!(top_two.contains(&"B"));
-        // C 和 D 各只出现一端
         assert_eq!(result.len(), 4);
     }
 
@@ -180,25 +192,59 @@ mod tests {
         let vec_rank = vec!["A", "B"];
         let fts_rank = vec!["B", "A"];
 
-        // vec_weight=1.0 → 纯向量排序
         let result_vec = rrf_merge(&vec_rank, &fts_rank, 1.0);
-        assert_eq!(result_vec[0].0, "A"); // A 在 vec 排第一
+        assert_eq!(result_vec[0].0, "A");
 
-        // vec_weight=0.0 → 纯 FTS 排序
         let result_fts = rrf_merge(&vec_rank, &fts_rank, 0.0);
-        assert_eq!(result_fts[0].0, "B"); // B 在 fts 排第一
+        assert_eq!(result_fts[0].0, "B");
     }
 
     #[test]
     fn test_hybrid_top_k() {
-        // top_k 在 retrieve 中测试，这里验证 RRF 返回所有唯一结果
-        let vec_rank: Vec<&str> = (0..10).map(|i| match i {
-            0 => "a", 1 => "b", 2 => "c", 3 => "d", 4 => "e",
-            5 => "f", 6 => "g", 7 => "h", 8 => "i", _ => "j",
-        }).collect();
+        let vec_rank: Vec<&str> = (0..10)
+            .map(|i| match i {
+                0 => "a", 1 => "b", 2 => "c", 3 => "d", 4 => "e",
+                5 => "f", 6 => "g", 7 => "h", 8 => "i", _ => "j",
+            })
+            .collect();
         let fts_rank = vec!["b", "d", "f"];
 
         let result = rrf_merge(&vec_rank, &fts_rank, 0.5);
-        assert_eq!(result.len(), 10); // 10 unique IDs
+        assert_eq!(result.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_index_dedup() {
+        use async_trait::async_trait;
+
+        struct FakeEmbed;
+        #[async_trait]
+        impl EmbeddingProvider for FakeEmbed {
+            async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+                Ok(texts.iter().map(|_| vec![0.1, 0.2]).collect())
+            }
+            fn dimension(&self) -> usize { 2 }
+        }
+
+        let db = Arc::new(MemoryDb::open(":memory:").unwrap());
+        let retriever = HybridRetriever::new(db.clone(), Box::new(FakeEmbed), 0.5);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("test.rs");
+        std::fs::write(&file, "fn hello() {}").unwrap();
+
+        // Index twice — second should be skipped (same hash)
+        retriever.index(&[file.clone()]).await.unwrap();
+        retriever.index(&[file.clone()]).await.unwrap();
+
+        let results = db.vec_knn(&[0.1, 0.2], 10).unwrap();
+        assert_eq!(results.len(), 1); // Not duplicated
+
+        // Modify file — should re-index
+        std::fs::write(&file, "fn changed() {}").unwrap();
+        retriever.index(&[file.clone()]).await.unwrap();
+
+        let results = db.fts_search("changed", 10).unwrap();
+        assert!(!results.is_empty());
     }
 }

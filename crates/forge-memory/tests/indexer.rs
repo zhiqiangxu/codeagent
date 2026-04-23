@@ -2,9 +2,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use forge_core::{Content, EmbeddingProvider, Message, Role};
-use forge_memory::fts_store::Fts5Store;
 use forge_memory::indexer::{FileChange, FileChangeKind, IncrementalIndexer};
-use forge_memory::vec_store::SqliteVecStore;
+use forge_memory::MemoryDb;
 use tempfile::TempDir;
 
 struct FakeEmbedding;
@@ -26,23 +25,16 @@ impl EmbeddingProvider for FakeEmbedding {
 }
 
 fn make_indexer(tmp: &TempDir) -> Arc<IncrementalIndexer> {
-    let vec_store = Arc::new(
-        SqliteVecStore::open(tmp.path().join("vec.db").to_str().unwrap(), 3).unwrap(),
+    let db = Arc::new(
+        MemoryDb::open(tmp.path().join("memory.db").to_str().unwrap()).unwrap(),
     );
-    let fts_store =
-        Arc::new(Fts5Store::open(tmp.path().join("fts.db").to_str().unwrap()).unwrap());
-    Arc::new(IncrementalIndexer::new(
-        vec_store,
-        fts_store,
-        Arc::new(FakeEmbedding),
-    ))
+    Arc::new(IncrementalIndexer::new(db, Arc::new(FakeEmbedding)))
 }
 
 #[tokio::test]
 async fn test_incremental_index_async() {
     let tmp = TempDir::new().unwrap();
 
-    // 创建 3 个文件
     for i in 0..3 {
         let path = tmp.path().join(format!("file{}.rs", i));
         std::fs::write(&path, format!("fn func{}() {{}}", i)).unwrap();
@@ -61,17 +53,11 @@ async fn test_incremental_index_async() {
         })
         .collect();
 
-    // 后台批量索引
     let handle = indexer.clone().process_batch(changes);
-
-    // 主线程不阻塞（这里直接 await，实际使用中可以做其他事）
     handle.await.unwrap().unwrap();
 
-    // 验证 3 个文件都被索引了 — 用 vec_store KNN 查询
-    let vec_store = Arc::new(
-        SqliteVecStore::open(tmp.path().join("vec.db").to_str().unwrap(), 3).unwrap(),
-    );
-    let results = vec_store.knn(&[0.1, 0.2, 0.3], 10).unwrap();
+    let db = MemoryDb::open(tmp.path().join("memory.db").to_str().unwrap()).unwrap();
+    let results = db.vec_knn(&[0.1, 0.2, 0.3], 10).unwrap();
     assert_eq!(results.len(), 3);
 }
 
@@ -95,12 +81,10 @@ async fn test_index_conversation_turn() {
 
     indexer.on_turn_end(&messages).await.unwrap();
 
-    // 验证对话内容被索引
-    let fts_store =
-        Fts5Store::open(tmp.path().join("fts.db").to_str().unwrap()).unwrap();
-    let results = fts_store.search("authentication", 10).unwrap();
+    let db = MemoryDb::open(tmp.path().join("memory.db").to_str().unwrap()).unwrap();
+    let results = db.fts_search("authentication", 10).unwrap();
     assert!(!results.is_empty());
 
-    let results2 = fts_store.search("JWT", 10).unwrap();
+    let results2 = db.fts_search("JWT", 10).unwrap();
     assert!(!results2.is_empty());
 }
